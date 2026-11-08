@@ -4,7 +4,7 @@ import {
   Video, VideoOff, Mic, MicOff, PhoneOff, Globe2, Languages,
   ShieldCheck, ArrowRight, Eye, EyeOff, User, Users, Plus,
   LogOut, CalendarDays, Copy, Monitor, MessageCircle, Send,
-  Trash2, ImagePlus, X, UserCircle, RefreshCw
+  Trash2, ImagePlus, X, RefreshCw
 } from "lucide-react";
 import "./index.css";
 
@@ -38,7 +38,9 @@ interface MeetingResponse {
 interface ChatMessage {
   id: number;
   sender_id: number;
+  user_id?: number;
   sender_name?: string;
+  full_name?: string;
   message: string;
   created_at?: string;
   profile_picture?: string | null;
@@ -52,6 +54,7 @@ interface DirectMessage {
   created_at?: string;
   sender_name?: string;
   profile_picture?: string | null;
+  is_read?: boolean;
 }
 
 interface Participant {
@@ -59,11 +62,16 @@ interface Participant {
   stream: MediaStream;
 }
 
-const WS_PROTOCOL =
-  window.location.protocol === "https:" ? "wss" : "ws";
+// Use the same API host for WebSocket connections.
+// This supports localhost, LAN and HTTPS deployment.
+const API_BASE_URL = (
+  api.defaults.baseURL ||
+  `${window.location.protocol}//${window.location.hostname}:8000`
+).replace(/\/+$/, "");
 
-const WS_BASE =
-  `${WS_PROTOCOL}://${window.location.hostname}:8000`;
+const WS_BASE = API_BASE_URL
+  .replace(/^https:/, "wss:")
+  .replace(/^http:/, "ws:");
 
 function Avatar({
   picture,
@@ -93,7 +101,11 @@ function Avatar({
         <img
           src={picture}
           alt={name || "Profile"}
-          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+          }}
         />
       ) : (
         <User size={size * 0.55} />
@@ -140,6 +152,22 @@ function getErrorMessage(err: any): string {
   }
 
   return err.message || "Something went wrong. Please try again.";
+}
+
+function normalizeDirectMessage(item: any): DirectMessage {
+  return {
+    id: Number(item.id),
+    sender_id: Number(item.sender_id),
+    receiver_id: Number(item.receiver_id),
+    message: String(item.message || ""),
+    created_at: item.created_at,
+    sender_name: item.sender_name,
+    profile_picture:
+      item.profile_picture ??
+      item.sender_profile_picture ??
+      null,
+    is_read: item.is_read,
+  };
 }
 
 const styles: Record<string, React.CSSProperties> = {
@@ -242,12 +270,12 @@ export default function App() {
   const peerConnectionsRef = useRef<Map<number, RTCPeerConnection>>(new Map());
   const pendingCandidatesRef = useRef<Map<number, RTCIceCandidateInit[]>>(new Map());
 
-  // Profile picture
+  // Profile
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileMessage, setProfileMessage] = useState("");
   const profileInputRef = useRef<HTMLInputElement>(null);
 
-  // Meeting group chat
+  // Meeting chat
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatText, setChatText] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -259,84 +287,147 @@ export default function App() {
   const [directMessages, setDirectMessages] = useState<DirectMessage[]>([]);
   const [directText, setDirectText] = useState("");
   const [directLoading, setDirectLoading] = useState(false);
-  const [privateSocket, setPrivateSocket] = useState<WebSocket | null>(null);
+  const [sendingDirect, setSendingDirect] = useState(false);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [usersError, setUsersError] = useState("");
+  const [usersRefreshKey, setUsersRefreshKey] = useState(0);
+  const [privateSocketStatus, setPrivateSocketStatus] = useState("Connecting...");
+
   const privateSocketRef = useRef<WebSocket | null>(null);
   const directEndRef = useRef<HTMLDivElement>(null);
-
-  // Keep selected user available to the WebSocket without reconnecting.
   const selectedUserRef = useRef<UserData | null>(null);
+
   selectedUserRef.current = selectedUser;
 
-  // Load meetings and profile when logged in
+  // =========================
+  // LOAD USER DATA
+  // =========================
+
   useEffect(() => {
     if (!currentUser) return;
+
+    let cancelled = false;
 
     const loadUserData = async () => {
       try {
         const [meetingResponse, userResponse] = await Promise.all([
           api.get(`/api/meetings/user/${currentUser.id}`),
-          api.get(`/api/users/${currentUser.id}`).catch(() => null),
+          api.get(`/api/users/${currentUser.id}`),
         ]);
 
-        const data = meetingResponse.data;
+        if (cancelled) return;
 
-        setMeetings(
-          Array.isArray(data) ? data : data.meetings || []
-        );
+        const meetingData = meetingResponse.data;
+        const meetingList = Array.isArray(meetingData)
+          ? meetingData
+          : meetingData.meetings || [];
 
-        if (userResponse?.data) {
-          const updatedUser = userResponse.data.user || userResponse.data;
+        setMeetings(meetingList);
 
-          setCurrentUser((previous) => {
-            if (!previous) return previous;
+        const updatedUser =
+          userResponse.data.user || userResponse.data;
 
-            const merged = { ...previous, ...updatedUser };
+        setCurrentUser((previous) => {
+          if (!previous) return previous;
 
-            localStorage.setItem(
-              "meetingZoneUser",
-              JSON.stringify(merged)
-            );
+          const merged = { ...previous, ...updatedUser };
 
-            return merged;
-          });
-        }
+          localStorage.setItem(
+            "meetingZoneUser",
+            JSON.stringify(merged)
+          );
+
+          return merged;
+        });
       } catch (err: any) {
-        setDashboardError(getErrorMessage(err));
+        if (!cancelled) {
+          setDashboardError(getErrorMessage(err));
+        }
       }
     };
 
     loadUserData();
+
+    return () => {
+      cancelled = true;
+    };
   }, [currentUser?.id]);
 
-  // Load users for private messaging
+  // =========================
+  // LOAD ALL OTHER USERS
+  // =========================
+
+  const refreshUsers = () => {
+    setUsersRefreshKey((value) => value + 1);
+  };
+
   useEffect(() => {
-    if (!currentUser) return;
+    if (!currentUser) {
+      setAllUsers([]);
+      setParticipantUsers([]);
+      return;
+    }
+
+    let cancelled = false;
 
     const loadUsers = async () => {
+      setUsersLoading(true);
+      setUsersError("");
+
       try {
         const response = await api.get(
           `/api/users?current_user_id=${currentUser.id}`
         );
 
-        const list: UserData[] = Array.isArray(response.data)
-          ? response.data
-          : response.data.users || [];
+        const result = response.data;
+
+        const list: UserData[] = Array.isArray(result)
+          ? result
+          : Array.isArray(result.users)
+            ? result.users
+            : [];
 
         const otherUsers = list.filter(
-          (user) => user.id !== currentUser.id
+          (person) =>
+            Number(person.id) !== Number(currentUser.id)
         );
 
-        setAllUsers(otherUsers);
-        setParticipantUsers(otherUsers);
-      } catch (err) {
-        console.error("Could not load users:", err);
+        if (!cancelled) {
+          setAllUsers(otherUsers);
+          setParticipantUsers(otherUsers);
+
+          if (
+            selectedUser &&
+            !otherUsers.some(
+              (person) => person.id === selectedUser.id
+            )
+          ) {
+            setSelectedUser(null);
+            setDirectMessages([]);
+          }
+        }
+      } catch (err: any) {
+        if (!cancelled) {
+          setUsersError(getErrorMessage(err));
+        }
+      } finally {
+        if (!cancelled) {
+          setUsersLoading(false);
+        }
       }
     };
 
     loadUsers();
-  }, [currentUser?.id]);
 
-  // Profile picture upload
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser?.id, usersRefreshKey]);
+
+  // =========================
+  // PROFILE PICTURE UPLOAD
+  // =========================
+
   const uploadProfilePicture = async (file?: File) => {
     if (!file || !currentUser) return;
 
@@ -366,7 +457,9 @@ export default function App() {
           const updated = response.data.user || response.data;
 
           const newPicture =
-            updated.profile_picture || reader.result?.toString() || null;
+            updated.profile_picture ||
+            reader.result?.toString() ||
+            null;
 
           setCurrentUser((previous) => {
             if (!previous) return previous;
@@ -439,7 +532,10 @@ export default function App() {
     }
   };
 
-  // Camera and microphone
+  // =========================
+  // CAMERA AND MICROPHONE
+  // =========================
+
   useEffect(() => {
     if (!activeMeeting) return;
 
@@ -454,10 +550,11 @@ export default function App() {
           );
         }
 
-        const mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true,
-        });
+        const mediaStream =
+          await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true,
+          });
 
         if (cancelled) {
           mediaStream.getTracks().forEach((track) => track.stop());
@@ -473,7 +570,7 @@ export default function App() {
         if (!cancelled) {
           setRoomError(
             err.message ||
-            "Camera or microphone permission denied. Please allow access in your browser."
+            "Camera or microphone permission denied. Please allow access."
           );
         }
       }
@@ -500,32 +597,54 @@ export default function App() {
     }
   }, [localStream]);
 
-  // Meeting chat history
+  // =========================
+  // MEETING CHAT HISTORY
+  // =========================
+
   useEffect(() => {
-    if (!activeMeeting) return;
+    if (!activeMeeting || !currentUser) return;
+
+    let cancelled = false;
 
     const loadChat = async () => {
       setChatLoading(true);
 
       try {
         const response = await api.get(
-          `/api/meetings/${encodeURIComponent(activeMeeting.meeting_code)}/messages`
+          `/api/meetings/${encodeURIComponent(
+            activeMeeting.meeting_code
+          )}/messages?user_id=${currentUser.id}`
         );
 
-        const list = Array.isArray(response.data)
-          ? response.data
-          : response.data.messages || [];
+        const result = response.data;
 
-        setChatMessages(list);
-      } catch (err) {
-        console.error("Could not load meeting messages:", err);
+        const list = Array.isArray(result)
+          ? result
+          : result.messages || [];
+
+        if (!cancelled) {
+          setChatMessages(list);
+        }
+      } catch (err: any) {
+        if (!cancelled) {
+          console.error(
+            "Could not load meeting messages:",
+            getErrorMessage(err)
+          );
+        }
       } finally {
-        setChatLoading(false);
+        if (!cancelled) {
+          setChatLoading(false);
+        }
       }
     };
 
     loadChat();
-  }, [activeMeeting?.meeting_code]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeMeeting?.meeting_code, currentUser?.id]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({
@@ -533,7 +652,10 @@ export default function App() {
     });
   }, [chatMessages]);
 
-  // WebRTC and meeting WebSocket
+  // =========================
+  // WEBRTC + MEETING WEBSOCKET
+  // =========================
+
   useEffect(() => {
     if (!activeMeeting || !currentUser || !localStream) return;
 
@@ -559,7 +681,8 @@ export default function App() {
       peerId: number,
       pc: RTCPeerConnection
     ) => {
-      const queued = pendingCandidatesRef.current.get(peerId) || [];
+      const queued =
+        pendingCandidatesRef.current.get(peerId) || [];
 
       pendingCandidatesRef.current.delete(peerId);
 
@@ -575,7 +698,8 @@ export default function App() {
     };
 
     const createPeerConnection = (peerId: number) => {
-      const existing = peerConnectionsRef.current.get(peerId);
+      const existing =
+        peerConnectionsRef.current.get(peerId);
 
       if (existing) return existing;
 
@@ -605,7 +729,9 @@ export default function App() {
         if (!incomingStream || disposed) return;
 
         setRemoteParticipants((previous) => [
-          ...previous.filter((item) => item.userId !== peerId),
+          ...previous.filter(
+            (item) => item.userId !== peerId
+          ),
           {
             userId: peerId,
             stream: incomingStream,
@@ -637,7 +763,6 @@ export default function App() {
         if (pc.signalingState !== "stable") return;
 
         const offer = await pc.createOffer();
-
         await pc.setLocalDescription(offer);
 
         sendSignal({
@@ -683,7 +808,6 @@ export default function App() {
 
         if (message.type === "offer") {
           const peerId = Number(message.from_user_id);
-
           const pc = createPeerConnection(peerId);
 
           await pc.setRemoteDescription(
@@ -693,7 +817,6 @@ export default function App() {
           await flushPendingCandidates(peerId, pc);
 
           const answer = await pc.createAnswer();
-
           await pc.setLocalDescription(answer);
 
           sendSignal({
@@ -705,8 +828,8 @@ export default function App() {
 
         if (message.type === "answer") {
           const peerId = Number(message.from_user_id);
-
-          const pc = peerConnectionsRef.current.get(peerId);
+          const pc =
+            peerConnectionsRef.current.get(peerId);
 
           if (pc) {
             await pc.setRemoteDescription(
@@ -719,8 +842,8 @@ export default function App() {
 
         if (message.type === "ice-candidate") {
           const peerId = Number(message.from_user_id);
-
-          const pc = peerConnectionsRef.current.get(peerId);
+          const pc =
+            peerConnectionsRef.current.get(peerId);
 
           if (pc && pc.remoteDescription) {
             await pc.addIceCandidate(
@@ -731,33 +854,47 @@ export default function App() {
               pendingCandidatesRef.current.get(peerId) || [];
 
             queued.push(message.payload);
-
             pendingCandidatesRef.current.set(peerId, queued);
           }
         }
 
-        // Incoming group chat message
         if (message.type === "chat-message") {
           const incoming =
-            message.message_data || message.data || message;
+            message.message_data ||
+            message.data ||
+            message;
 
           setChatMessages((previous) => {
             if (
-              previous.some((item) => item.id === incoming.id)
+              previous.some(
+                (item) => item.id === incoming.id
+              )
             ) {
               return previous;
             }
 
-            return [...previous, incoming];
+            return [
+              ...previous,
+              {
+                ...incoming,
+                sender_id: Number(
+                  incoming.sender_id ?? incoming.user_id
+                ),
+                sender_name:
+                  incoming.sender_name ??
+                  incoming.full_name,
+              },
+            ];
           });
         }
 
-        // Host deleted a group chat message
         if (message.type === "chat-deleted") {
           const deletedId = Number(message.message_id);
 
           setChatMessages((previous) =>
-            previous.filter((item) => item.id !== deletedId)
+            previous.filter(
+              (item) => item.id !== deletedId
+            )
           );
         }
 
@@ -769,13 +906,16 @@ export default function App() {
           pendingCandidatesRef.current.delete(peerId);
 
           setRemoteParticipants((previous) =>
-            previous.filter((item) => item.userId !== peerId)
+            previous.filter(
+              (item) => item.userId !== peerId
+            )
           );
         }
 
         if (message.type === "error") {
           setRoomError(
-            message.message || "Meeting server returned an error."
+            message.message ||
+            "Meeting server returned an error."
           );
         }
       } catch (err) {
@@ -785,9 +925,8 @@ export default function App() {
 
     socket.onerror = () => {
       setConnectionStatus("Meeting server connection error");
-
       setRoomError(
-        "Could not connect to the meeting server. Check FastAPI."
+        "Could not connect to meeting server. Check FastAPI."
       );
     };
 
@@ -818,7 +957,10 @@ export default function App() {
     };
   }, [activeMeeting, currentUser, localStream]);
 
-  // Ready-made quick messages for the meeting chat
+  // =========================
+  // MEETING CHAT ACTIONS
+  // =========================
+
   const quickMessages = [
     "Great meeting! 👍",
     "Nice! 😊",
@@ -827,7 +969,6 @@ export default function App() {
     "Thank you! 🙏",
   ];
 
-  // Send a quick message or a custom message
   const sendMeetingMessage = (messageText: string = chatText) => {
     const cleanMessage = messageText.trim();
 
@@ -840,7 +981,6 @@ export default function App() {
       setRoomError(
         "Meeting chat is not connected yet. Please wait and try again."
       );
-
       return;
     }
 
@@ -854,7 +994,6 @@ export default function App() {
     setChatText("");
   };
 
-  // Delete meeting chat message (host only)
   const deleteMeetingMessage = (messageId: number) => {
     if (
       !socketRef.current ||
@@ -876,52 +1015,64 @@ export default function App() {
     );
   };
 
-  // Private messaging WebSocket
+  // =========================
+  // PRIVATE MESSAGING WEBSOCKET
+  // =========================
+
   useEffect(() => {
     if (!currentUser) return;
+
+    let disposed = false;
 
     const socket = new WebSocket(
       `${WS_BASE}/ws/users/${currentUser.id}`
     );
 
     privateSocketRef.current = socket;
-    setPrivateSocket(socket);
+    setPrivateSocketStatus("Connecting...");
+
+    socket.onopen = () => {
+      if (!disposed) {
+        setPrivateSocketStatus("Connected");
+      }
+    };
 
     socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
 
-        const incoming =
+        if (data.type === "connected") {
+          setPrivateSocketStatus("Connected");
+          return;
+        }
+
+        const rawIncoming =
           data.message_data ??
           data.data ??
           (
             typeof data.message === "object"
               ? data.message
               : null
-          ) ??
-          data;
+          );
 
+        if (!rawIncoming || !rawIncoming.id) return;
+
+        const incoming = normalizeDirectMessage(rawIncoming);
         const activeRecipient = selectedUserRef.current;
 
+        // Only show messages belonging to the open conversation.
         if (
-          incoming &&
-          typeof incoming === "object" &&
-          typeof incoming.id === "number" &&
-          (
-            data.type === "private-message" ||
-            data.type === "new-message" ||
-            data.type === "message" ||
-            data.type === undefined
-          ) &&
           activeRecipient &&
           (
-            Number(incoming.sender_id) === activeRecipient.id ||
-            Number(incoming.receiver_id) === activeRecipient.id
+            incoming.sender_id === activeRecipient.id ||
+            incoming.receiver_id === activeRecipient.id
           )
         ) {
           setDirectMessages((previous) => {
             if (
-              previous.some((item) => item.id === incoming.id)
+              previous.some(
+                (item) => item.id === incoming.id
+              )
             ) {
               return previous;
             }
@@ -929,26 +1080,43 @@ export default function App() {
             return [...previous, incoming];
           });
         }
+
+        // Refresh list so new conversations can appear.
+        setUsersRefreshKey((value) => value + 1);
       } catch (err) {
         console.error("Private message socket error:", err);
       }
     };
 
     socket.onerror = () => {
-      console.error(
-        "Private messaging WebSocket connection error."
-      );
+      if (!disposed) {
+        setPrivateSocketStatus("Connection error");
+      }
+    };
+
+    socket.onclose = () => {
+      if (!disposed) {
+        setPrivateSocketStatus("Disconnected");
+      }
     };
 
     return () => {
+      disposed = true;
+
       socket.close();
 
-      privateSocketRef.current = null;
-      setPrivateSocket(null);
+      if (privateSocketRef.current === socket) {
+        privateSocketRef.current = null;
+      }
+
+      setPrivateSocketStatus("Disconnected");
     };
   }, [currentUser?.id]);
 
-  // Load private conversation history
+  // =========================
+  // PRIVATE CHAT HISTORY
+  // =========================
+
   useEffect(() => {
     if (!currentUser || !selectedUser) {
       setDirectMessages([]);
@@ -965,18 +1133,23 @@ export default function App() {
           `/api/messages/${currentUser.id}/${selectedUser.id}`
         );
 
-        const list = Array.isArray(response.data)
-          ? response.data
-          : response.data.messages || [];
+        const result = response.data;
+
+        const list = Array.isArray(result)
+          ? result
+          : result.messages || [];
 
         if (!cancelled) {
-          setDirectMessages(list);
+          setDirectMessages(
+            list.map(normalizeDirectMessage)
+          );
         }
       } catch (err: any) {
-        console.error(
-          "Could not load private messages:",
-          getErrorMessage(err)
-        );
+        if (!cancelled) {
+          const message = getErrorMessage(err);
+          console.error("Could not load private messages:", message);
+          setDashboardError(message);
+        }
       } finally {
         if (!cancelled) {
           setDirectLoading(false);
@@ -997,43 +1170,67 @@ export default function App() {
     });
   }, [directMessages]);
 
-  // Send private message
+  // =========================
+  // SEND PRIVATE MESSAGE
+  // =========================
+
   const sendDirectMessage = async () => {
     if (
       !currentUser ||
       !selectedUser ||
-      !directText.trim()
+      !directText.trim() ||
+      sendingDirect
     ) {
       return;
     }
 
     const messageText = directText.trim();
+    const recipient = selectedUser;
 
+    setSendingDirect(true);
     setDirectText("");
 
     try {
       const response = await api.post("/api/messages", {
         sender_id: currentUser.id,
-        receiver_id: selectedUser.id,
+        receiver_id: recipient.id,
         message: messageText,
       });
 
-      const sent =
+      const sentRaw =
         response.data.message_data ||
-        response.data.message ||
-        response.data;
+        response.data.data;
 
-      if (sent && sent.id) {
+      if (sentRaw) {
+        const sent = normalizeDirectMessage(sentRaw);
+
         setDirectMessages((previous) => {
           if (
-            previous.some((item) => item.id === sent.id)
+            previous.some(
+              (item) => item.id === sent.id
+            )
           ) {
             return previous;
           }
 
           return [...previous, sent];
         });
+      } else {
+        // Fallback: reload conversation if server response has no message.
+        const history = await api.get(
+          `/api/messages/${currentUser.id}/${recipient.id}`
+        );
+
+        setDirectMessages(
+          (history.data.messages || []).map(
+            normalizeDirectMessage
+          )
+        );
       }
+
+      setDashboardError("");
+      setRoomError("");
+      setUsersRefreshKey((value) => value + 1);
     } catch (err: any) {
       setDirectText(messageText);
 
@@ -1044,10 +1241,15 @@ export default function App() {
       } else {
         setDashboardError(message);
       }
+    } finally {
+      setSendingDirect(false);
     }
   };
 
-  // Signup and Login
+  // =========================
+  // SIGNUP / LOGIN
+  // =========================
+
   const handleAuth = async (
     e: React.FormEvent<HTMLFormElement>
   ) => {
@@ -1097,7 +1299,10 @@ export default function App() {
     }
   };
 
-  // Create meeting
+  // =========================
+  // CREATE MEETING
+  // =========================
+
   const createMeeting = async () => {
     if (!currentUser) return;
 
@@ -1131,7 +1336,10 @@ export default function App() {
     }
   };
 
-  // Join meeting
+  // =========================
+  // JOIN MEETING
+  // =========================
+
   const joinMeeting = async () => {
     if (!currentUser || !meetingCode.trim()) {
       setDashboardError("Please enter a meeting code.");
@@ -1166,12 +1374,14 @@ export default function App() {
       setMeetings(meetingList);
 
       const joinedMeeting = meetingList.find(
-        (meeting) => meeting.meeting_code === enteredCode
+        (meeting) =>
+          meeting.meeting_code === enteredCode
       );
 
       if (!joinedMeeting) {
         setDashboardMessage(
-          response.data.message || "Meeting joined successfully."
+          response.data.message ||
+          "Meeting joined successfully."
         );
 
         setDashboardError(
@@ -1190,6 +1400,10 @@ export default function App() {
       setMeetingLoading(false);
     }
   };
+
+  // =========================
+  // CAMERA / MIC CONTROLS
+  // =========================
 
   const toggleCamera = () => {
     if (!localStream) return;
@@ -1214,6 +1428,10 @@ export default function App() {
 
     setMicOn(next);
   };
+
+  // =========================
+  // LEAVE MEETING
+  // =========================
 
   const leaveMeeting = () => {
     const socket = socketRef.current;
@@ -1244,10 +1462,15 @@ export default function App() {
     setChatText("");
   };
 
+  // =========================
+  // LOGOUT
+  // =========================
+
   const logout = () => {
     leaveMeeting();
 
     privateSocketRef.current?.close();
+    privateSocketRef.current = null;
 
     localStorage.removeItem("meetingZoneUser");
 
@@ -1263,11 +1486,16 @@ export default function App() {
     setSuccess("");
     setDashboardMessage("");
     setDashboardError("");
+    setUsersError("");
   };
 
+  // =========================
   // MEETING ROOM
+  // =========================
+
   if (currentUser && activeMeeting) {
-    const isHost = activeMeeting.host_id === currentUser.id;
+    const isHost =
+      activeMeeting.host_id === currentUser.id;
 
     return (
       <main
@@ -1508,86 +1736,95 @@ export default function App() {
                   </p>
                 )}
 
-                {chatMessages.map((message) => (
-                  <div
-                    key={message.id}
-                    style={{
-                      display: "flex",
-                      gap: 9,
-                      alignItems: "flex-start",
-                      marginBottom: 15,
-                    }}
-                  >
-                    <Avatar
-                      picture={message.profile_picture}
-                      name={message.sender_name}
-                      size={34}
-                    />
+                {chatMessages.map((message) => {
+                  const senderId = Number(
+                    message.sender_id ?? message.user_id
+                  );
 
+                  return (
                     <div
+                      key={message.id}
                       style={{
-                        flex: 1,
-                        minWidth: 0,
+                        display: "flex",
+                        gap: 9,
+                        alignItems: "flex-start",
+                        marginBottom: 15,
                       }}
                     >
+                      <Avatar
+                        picture={message.profile_picture}
+                        name={
+                          message.sender_name ||
+                          message.full_name
+                        }
+                        size={34}
+                      />
+
                       <div
                         style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          gap: 8,
-                          flexWrap: "wrap",
+                          flex: 1,
+                          minWidth: 0,
                         }}
                       >
-                        <strong style={{ fontSize: 13 }}>
-                          {message.sender_id === currentUser.id
-                            ? "You"
-                            : message.sender_name ||
-                              `User ${message.sender_id}`}
-                        </strong>
+                        <div
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            gap: 8,
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <strong style={{ fontSize: 13 }}>
+                            {senderId === currentUser.id
+                              ? "You"
+                              : message.sender_name ||
+                                message.full_name ||
+                                `User ${senderId}`}
+                          </strong>
 
-                        {isHost && (
-                          <button
-                            onClick={() =>
-                              deleteMeetingMessage(message.id)
-                            }
-                            title="Delete message"
-                            style={{
-                              background: "transparent",
-                              border: 0,
-                              color: "#f87171",
-                              cursor: "pointer",
-                            }}
-                          >
-                            <Trash2 size={15} />
-                          </button>
+                          {isHost && (
+                            <button
+                              onClick={() =>
+                                deleteMeetingMessage(message.id)
+                              }
+                              title="Delete message"
+                              style={{
+                                background: "transparent",
+                                border: 0,
+                                color: "#f87171",
+                                cursor: "pointer",
+                              }}
+                            >
+                              <Trash2 size={15} />
+                            </button>
+                          )}
+                        </div>
+
+                        <p
+                          style={{
+                            margin: "5px 0",
+                            color: "#e2e8f0",
+                            overflowWrap: "anywhere",
+                          }}
+                        >
+                          {message.message}
+                        </p>
+
+                        {message.created_at && (
+                          <small style={{ color: "#64748b" }}>
+                            {new Date(
+                              message.created_at
+                            ).toLocaleTimeString()}
+                          </small>
                         )}
                       </div>
-
-                      <p
-                        style={{
-                          margin: "5px 0",
-                          color: "#e2e8f0",
-                          overflowWrap: "anywhere",
-                        }}
-                      >
-                        {message.message}
-                      </p>
-
-                      {message.created_at && (
-                        <small style={{ color: "#64748b" }}>
-                          {new Date(
-                            message.created_at
-                          ).toLocaleTimeString()}
-                        </small>
-                      )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
 
                 <div ref={chatEndRef} />
               </div>
 
-              {/* QUICK MESSAGES */}
               <div
                 style={{
                   display: "flex",
@@ -1616,7 +1853,6 @@ export default function App() {
                 ))}
               </div>
 
-              {/* CUSTOM MESSAGE */}
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
@@ -1751,22 +1987,56 @@ export default function App() {
                 paddingTop: 18,
               }}
             >
-              <h3
+              <div
                 style={{
                   display: "flex",
-                  gap: 10,
+                  justifyContent: "space-between",
                   alignItems: "center",
+                  gap: 8,
                 }}
               >
-                <MessageCircle size={20} />
-                Private Chat
-              </h3>
+                <h3
+                  style={{
+                    display: "flex",
+                    gap: 10,
+                    alignItems: "center",
+                    margin: 0,
+                  }}
+                >
+                  <MessageCircle size={20} />
+                  Private Chat
+                </h3>
+
+                <button
+                  type="button"
+                  onClick={refreshUsers}
+                  title="Refresh users"
+                  style={{
+                    ...styles.action,
+                    padding: 8,
+                    background: "#334155",
+                  }}
+                >
+                  <RefreshCw size={16} />
+                </button>
+              </div>
+
+              <p
+                style={{
+                  color: "#94a3b8",
+                  fontSize: 11,
+                  margin: "8px 0",
+                }}
+              >
+                Private chat: {privateSocketStatus}
+              </p>
 
               <select
                 value={selectedUser?.id ?? ""}
                 onChange={(e) => {
                   const user = allUsers.find(
-                    (item) => item.id === Number(e.target.value)
+                    (item) =>
+                      item.id === Number(e.target.value)
                   );
 
                   setSelectedUser(user || null);
@@ -1789,6 +2059,24 @@ export default function App() {
                   </option>
                 ))}
               </select>
+
+              {usersLoading && (
+                <p style={{ color: "#94a3b8", fontSize: 12 }}>
+                  Loading users...
+                </p>
+              )}
+
+              {usersError && (
+                <p style={{ color: "#f87171", fontSize: 12 }}>
+                  {usersError}
+                </p>
+              )}
+
+              {!usersLoading && allUsers.length === 0 && (
+                <p style={{ color: "#94a3b8", fontSize: 12 }}>
+                  No other users found. Create another account and refresh.
+                </p>
+              )}
 
               {selectedUser ? (
                 <>
@@ -1952,7 +2240,7 @@ export default function App() {
                         ...styles.action,
                         padding: "9px 12px",
                       }}
-                      disabled={!directText.trim()}
+                      disabled={!directText.trim() || sendingDirect}
                     >
                       <Send size={17} />
                     </button>
@@ -1976,7 +2264,10 @@ export default function App() {
     );
   }
 
+  // =========================
   // DASHBOARD
+  // =========================
+
   if (currentUser) {
     return (
       <main className="dashboard-page">
@@ -2032,19 +2323,13 @@ export default function App() {
           </div>
 
           {dashboardMessage && (
-            <p
-              role="status"
-              style={{ color: "#16a34a" }}
-            >
+            <p role="status" style={{ color: "#16a34a" }}>
               {dashboardMessage}
             </p>
           )}
 
           {dashboardError && (
-            <p
-              role="alert"
-              style={{ color: "#dc2626" }}
-            >
+            <p role="alert" style={{ color: "#dc2626" }}>
               {dashboardError}
             </p>
           )}
@@ -2141,7 +2426,6 @@ export default function App() {
                 />
 
                 <strong>{currentUser.full_name}</strong>
-
                 <small>{currentUser.email}</small>
 
                 <input
@@ -2222,6 +2506,45 @@ export default function App() {
 
             <div
               style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: 10,
+                marginTop: 15,
+              }}
+            >
+              <small style={{ color: "#94a3b8" }}>
+                Private chat: {privateSocketStatus}
+              </small>
+
+              <button
+                type="button"
+                onClick={refreshUsers}
+                style={{
+                  ...styles.action,
+                  padding: "9px 12px",
+                }}
+              >
+                <RefreshCw size={16} />
+                Refresh Users
+              </button>
+            </div>
+
+            {usersError && (
+              <p
+                role="alert"
+                style={{
+                  color: "#f87171",
+                  marginTop: 10,
+                }}
+              >
+                {usersError}
+              </p>
+            )}
+
+            <div
+              style={{
                 display: "grid",
                 gridTemplateColumns:
                   "minmax(150px, 0.8fr) minmax(250px, 1.5fr)",
@@ -2247,21 +2570,32 @@ export default function App() {
                   Users
                 </h3>
 
-                {allUsers.length === 0 && (
+                {usersLoading && (
+                  <p style={{ color: "#94a3b8", fontSize: 13 }}>
+                    Loading users...
+                  </p>
+                )}
+
+                {!usersLoading && allUsers.length === 0 && (
                   <p
                     style={{
                       color: "#94a3b8",
                       fontSize: 13,
                     }}
                   >
-                    No other users found yet.
+                    No other users found yet. Create another account and refresh.
                   </p>
                 )}
 
                 {allUsers.map((person) => (
                   <button
                     key={person.id}
-                    onClick={() => setSelectedUser(person)}
+                    onClick={() => {
+                      setSelectedUser(person);
+                      setDirectMessages([]);
+                      setDirectText("");
+                      setDashboardError("");
+                    }}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -2432,6 +2766,7 @@ export default function App() {
                       <button
                         type="submit"
                         style={styles.action}
+                        disabled={!directText.trim() || sendingDirect}
                       >
                         <Send size={18} />
                       </button>
@@ -2537,7 +2872,10 @@ export default function App() {
     );
   }
 
+  // =========================
   // SIGNUP / LOGIN
+  // =========================
+
   return (
     <main className="page">
       <nav className="navbar">
@@ -2756,19 +3094,13 @@ export default function App() {
               )}
 
               {error && (
-                <p
-                  role="alert"
-                  style={{ color: "#dc2626" }}
-                >
+                <p role="alert" style={{ color: "#dc2626" }}>
                   {error}
                 </p>
               )}
 
               {success && (
-                <p
-                  role="status"
-                  style={{ color: "#16a34a" }}
-                >
+                <p role="status" style={{ color: "#16a34a" }}>
                   {success}
                 </p>
               )}
