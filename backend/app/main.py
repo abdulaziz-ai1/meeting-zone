@@ -145,11 +145,11 @@ app = FastAPI(
     description="Meeting Zone authentication, meetings, chat, profiles and WebRTC signaling",
     version="4.0.0"
 )
-
 # UPDATED CORS SETTINGS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://meeting-zone-xi.vercel.app",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://192.168.100.7:5173",
